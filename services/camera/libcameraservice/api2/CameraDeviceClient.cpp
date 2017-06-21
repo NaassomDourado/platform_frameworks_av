@@ -100,7 +100,14 @@ CameraDeviceClient::CameraDeviceClient(const sp<CameraService>& cameraService,
     mInputStream(),
     mStreamingRequestId(REQUEST_ID_NONE),
     mRequestIdCounter(0),
-    mOverrideForPerfClass(overrideForPerfClass) {
+    mPrivilegedClient(false) {
+
+    char value[PROPERTY_VALUE_MAX];
+    property_get("persist.vendor.camera.privapp.list", value, "");
+    String16 packagelist(value);
+    if (packagelist.contains(clientPackageName.string())) {
+        mPrivilegedClient = true;
+    }
 
     ATRACE_CALL();
     ALOGI("CameraDeviceClient %s: Opened", cameraId.string());
@@ -1230,6 +1237,226 @@ binder::Status CameraDeviceClient::updateOutputConfiguration(int streamId,
     }
 
     return res;
+}
+
+bool CameraDeviceClient::isPublicFormat(int32_t format)
+{
+    switch(format) {
+        case HAL_PIXEL_FORMAT_RGBA_8888:
+        case HAL_PIXEL_FORMAT_RGBX_8888:
+        case HAL_PIXEL_FORMAT_RGB_888:
+        case HAL_PIXEL_FORMAT_RGB_565:
+        case HAL_PIXEL_FORMAT_BGRA_8888:
+        case HAL_PIXEL_FORMAT_YV12:
+        case HAL_PIXEL_FORMAT_Y8:
+        case HAL_PIXEL_FORMAT_Y16:
+        case HAL_PIXEL_FORMAT_RAW16:
+        case HAL_PIXEL_FORMAT_RAW10:
+        case HAL_PIXEL_FORMAT_RAW12:
+        case HAL_PIXEL_FORMAT_RAW_OPAQUE:
+        case HAL_PIXEL_FORMAT_BLOB:
+        case HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED:
+        case HAL_PIXEL_FORMAT_YCbCr_420_888:
+        case HAL_PIXEL_FORMAT_YCbCr_422_SP:
+        case HAL_PIXEL_FORMAT_YCrCb_420_SP:
+        case HAL_PIXEL_FORMAT_YCbCr_422_I:
+            return true;
+        default:
+            return false;
+    }
+}
+
+binder::Status CameraDeviceClient::createSurfaceFromGbp(
+        OutputStreamInfo& streamInfo, bool isStreamInfoValid,
+        sp<Surface>& surface, const sp<IGraphicBufferProducer>& gbp,
+        const String8 &cameraId, const CameraMetadata &physicalCameraMetadata) {
+
+    // bufferProducer must be non-null
+    if (gbp == nullptr) {
+        String8 msg = String8::format("Camera %s: Surface is NULL", cameraId.string());
+        ALOGW("%s: %s", __FUNCTION__, msg.string());
+        return STATUS_ERROR(CameraService::ERROR_ILLEGAL_ARGUMENT, msg.string());
+    }
+    // HACK b/10949105
+    // Query consumer usage bits to set async operation mode for
+    // GLConsumer using controlledByApp parameter.
+    bool useAsync = false;
+    uint64_t consumerUsage = 0;
+    status_t err;
+    if ((err = gbp->getConsumerUsage(&consumerUsage)) != OK) {
+        String8 msg = String8::format("Camera %s: Failed to query Surface consumer usage: %s (%d)",
+                cameraId.string(), strerror(-err), err);
+        ALOGE("%s: %s", __FUNCTION__, msg.string());
+        return STATUS_ERROR(CameraService::ERROR_INVALID_OPERATION, msg.string());
+    }
+    if (consumerUsage & GraphicBuffer::USAGE_HW_TEXTURE) {
+        ALOGW("%s: Camera %s with consumer usage flag: %" PRIu64 ": Forcing asynchronous mode for stream",
+                __FUNCTION__, cameraId.string(), consumerUsage);
+        useAsync = true;
+    }
+
+    uint64_t disallowedFlags = GraphicBuffer::USAGE_HW_VIDEO_ENCODER |
+                              GRALLOC_USAGE_RENDERSCRIPT;
+    uint64_t allowedFlags = GraphicBuffer::USAGE_SW_READ_MASK |
+                           GraphicBuffer::USAGE_HW_TEXTURE |
+                           GraphicBuffer::USAGE_HW_COMPOSER;
+    bool flexibleConsumer = !mPrivilegedClient && (consumerUsage & disallowedFlags) == 0 &&
+            (consumerUsage & allowedFlags) != 0;
+
+    surface = new Surface(gbp, useAsync);
+    ANativeWindow *anw = surface.get();
+
+    int width, height, format;
+    android_dataspace dataSpace;
+    if ((err = anw->query(anw, NATIVE_WINDOW_WIDTH, &width)) != OK) {
+        String8 msg = String8::format("Camera %s: Failed to query Surface width: %s (%d)",
+                 cameraId.string(), strerror(-err), err);
+        ALOGE("%s: %s", __FUNCTION__, msg.string());
+        return STATUS_ERROR(CameraService::ERROR_INVALID_OPERATION, msg.string());
+    }
+    if ((err = anw->query(anw, NATIVE_WINDOW_HEIGHT, &height)) != OK) {
+        String8 msg = String8::format("Camera %s: Failed to query Surface height: %s (%d)",
+                cameraId.string(), strerror(-err), err);
+        ALOGE("%s: %s", __FUNCTION__, msg.string());
+        return STATUS_ERROR(CameraService::ERROR_INVALID_OPERATION, msg.string());
+    }
+    if ((err = anw->query(anw, NATIVE_WINDOW_FORMAT, &format)) != OK) {
+        String8 msg = String8::format("Camera %s: Failed to query Surface format: %s (%d)",
+                cameraId.string(), strerror(-err), err);
+        ALOGE("%s: %s", __FUNCTION__, msg.string());
+        return STATUS_ERROR(CameraService::ERROR_INVALID_OPERATION, msg.string());
+    }
+    if ((err = anw->query(anw, NATIVE_WINDOW_DEFAULT_DATASPACE,
+            reinterpret_cast<int*>(&dataSpace))) != OK) {
+        String8 msg = String8::format("Camera %s: Failed to query Surface dataspace: %s (%d)",
+                cameraId.string(), strerror(-err), err);
+        ALOGE("%s: %s", __FUNCTION__, msg.string());
+        return STATUS_ERROR(CameraService::ERROR_INVALID_OPERATION, msg.string());
+    }
+
+    // FIXME: remove this override since the default format should be
+    //       IMPLEMENTATION_DEFINED. b/9487482 & b/35317944
+    if ((format >= HAL_PIXEL_FORMAT_RGBA_8888 && format <= HAL_PIXEL_FORMAT_BGRA_8888) &&
+            ((consumerUsage & GRALLOC_USAGE_HW_MASK) &&
+             ((consumerUsage & GRALLOC_USAGE_SW_READ_MASK) == 0))) {
+        ALOGW("%s: Camera %s: Overriding format %#x to IMPLEMENTATION_DEFINED",
+                __FUNCTION__, cameraId.string(), format);
+        format = HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED;
+    }
+    // Round dimensions to the nearest dimensions available for this format
+    if (flexibleConsumer && isPublicFormat(format) &&
+            !CameraDeviceClient::roundBufferDimensionNearest(width, height,
+            format, dataSpace, physicalCameraMetadata, /*out*/&width, /*out*/&height)) {
+        String8 msg = String8::format("Camera %s: No supported stream configurations with "
+                "format %#x defined, failed to create output stream",
+                cameraId.string(), format);
+        ALOGE("%s: %s", __FUNCTION__, msg.string());
+        return STATUS_ERROR(CameraService::ERROR_ILLEGAL_ARGUMENT, msg.string());
+    }
+
+    if (!isStreamInfoValid) {
+        streamInfo.width = width;
+        streamInfo.height = height;
+        streamInfo.format = format;
+        streamInfo.dataSpace = dataSpace;
+        streamInfo.consumerUsage = consumerUsage;
+        return binder::Status::ok();
+    }
+    if (width != streamInfo.width) {
+        String8 msg = String8::format("Camera %s:Surface width doesn't match: %d vs %d",
+                cameraId.string(), width, streamInfo.width);
+        ALOGE("%s: %s", __FUNCTION__, msg.string());
+        return STATUS_ERROR(CameraService::ERROR_ILLEGAL_ARGUMENT, msg.string());
+    }
+    if (height != streamInfo.height) {
+        String8 msg = String8::format("Camera %s:Surface height doesn't match: %d vs %d",
+                 cameraId.string(), height, streamInfo.height);
+        ALOGE("%s: %s", __FUNCTION__, msg.string());
+        return STATUS_ERROR(CameraService::ERROR_ILLEGAL_ARGUMENT, msg.string());
+    }
+    if (format != streamInfo.format) {
+        String8 msg = String8::format("Camera %s:Surface format doesn't match: %d vs %d",
+                 cameraId.string(), format, streamInfo.format);
+        ALOGE("%s: %s", __FUNCTION__, msg.string());
+        return STATUS_ERROR(CameraService::ERROR_ILLEGAL_ARGUMENT, msg.string());
+    }
+    if (format != HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED) {
+        if (dataSpace != streamInfo.dataSpace) {
+            String8 msg = String8::format("Camera %s:Surface dataSpace doesn't match: %d vs %d",
+                    cameraId.string(), dataSpace, streamInfo.dataSpace);
+            ALOGE("%s: %s", __FUNCTION__, msg.string());
+            return STATUS_ERROR(CameraService::ERROR_ILLEGAL_ARGUMENT, msg.string());
+        }
+        //At the native side, there isn't a way to check whether 2 surfaces come from the same
+        //surface class type. Use usage flag to approximate the comparison.
+        if (consumerUsage != streamInfo.consumerUsage) {
+            String8 msg = String8::format(
+                    "Camera %s:Surface usage flag doesn't match %" PRIu64 " vs %" PRIu64 "",
+                    cameraId.string(), consumerUsage, streamInfo.consumerUsage);
+            ALOGE("%s: %s", __FUNCTION__, msg.string());
+            return STATUS_ERROR(CameraService::ERROR_ILLEGAL_ARGUMENT, msg.string());
+        }
+    }
+    return binder::Status::ok();
+}
+
+bool CameraDeviceClient::roundBufferDimensionNearest(int32_t width, int32_t height,
+        int32_t format, android_dataspace dataSpace, const CameraMetadata& info,
+        /*out*/int32_t* outWidth, /*out*/int32_t* outHeight) {
+
+    camera_metadata_ro_entry streamConfigs =
+            (dataSpace == HAL_DATASPACE_DEPTH) ?
+            info.find(ANDROID_DEPTH_AVAILABLE_DEPTH_STREAM_CONFIGURATIONS) :
+            (dataSpace == static_cast<android_dataspace>(HAL_DATASPACE_HEIF)) ?
+            info.find(ANDROID_HEIC_AVAILABLE_HEIC_STREAM_CONFIGURATIONS) :
+            info.find(ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS);
+
+    int32_t bestWidth = -1;
+    int32_t bestHeight = -1;
+
+    // Iterate through listed stream configurations and find the one with the smallest euclidean
+    // distance from the given dimensions for the given format.
+    for (size_t i = 0; i < streamConfigs.count; i += 4) {
+        int32_t fmt = streamConfigs.data.i32[i];
+        int32_t w = streamConfigs.data.i32[i + 1];
+        int32_t h = streamConfigs.data.i32[i + 2];
+
+        // Ignore input/output type for now
+        if (fmt == format) {
+            if (w == width && h == height) {
+                bestWidth = width;
+                bestHeight = height;
+                break;
+            } else if (w <= ROUNDING_WIDTH_CAP && (bestWidth == -1 ||
+                    CameraDeviceClient::euclidDistSquare(w, h, width, height) <
+                    CameraDeviceClient::euclidDistSquare(bestWidth, bestHeight, width, height))) {
+                bestWidth = w;
+                bestHeight = h;
+            }
+        }
+    }
+
+    if (bestWidth == -1) {
+        // Return false if no configurations for this format were listed
+        return false;
+    }
+
+    // Set the outputs to the closet width/height
+    if (outWidth != NULL) {
+        *outWidth = bestWidth;
+    }
+    if (outHeight != NULL) {
+        *outHeight = bestHeight;
+    }
+
+    // Return true if at least one configuration for this format was listed
+    return true;
+}
+
+int64_t CameraDeviceClient::euclidDistSquare(int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+    int64_t d0 = x0 - x1;
+    int64_t d1 = y0 - y1;
+    return d0 * d0 + d1 * d1;
 }
 
 // Create a request object from a template.
