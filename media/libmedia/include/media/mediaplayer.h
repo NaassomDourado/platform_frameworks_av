@@ -212,8 +212,8 @@ class MediaPlayer : public BnMediaPlayerClient,
                     public virtual IMediaDeathNotifier
 {
 public:
-    explicit MediaPlayer(const android::content::AttributionSourceState& mAttributionSource =
-        android::content::AttributionSourceState());
+    MediaPlayer();
+    explicit MediaPlayer(const android::content::AttributionSourceState& mAttributionSource);
     ~MediaPlayer();
             void            died();
             void            disconnect();

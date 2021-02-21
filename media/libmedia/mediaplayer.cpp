@@ -42,6 +42,11 @@ namespace android {
 using media::VolumeShaper;
 using content::AttributionSourceState;
 
+MediaPlayer::MediaPlayer()
+{
+    MediaPlayer(android::content::AttributionSourceState());
+}
+
 MediaPlayer::MediaPlayer(const AttributionSourceState& attributionSource)
         : mAttributionSource(attributionSource)
 {
